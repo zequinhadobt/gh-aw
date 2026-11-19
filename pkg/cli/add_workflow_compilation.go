@@ -1,0 +1,353 @@
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/fileutil"
+	"github.com/github/gh-aw/pkg/gitutil"
+	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/stringutil"
+	"github.com/github/gh-aw/pkg/workflow"
+)
+
+var addWorkflowCompilationLog = logger.New("cli:add_workflow_compilation")
+
+// compileWorkflow compiles a workflow file without refreshing stop time.
+// This is a convenience wrapper around compileWorkflowWithActionRef.
+func compileWorkflow(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride string) error {
+	return compileWorkflowWithActionRef(ctx, filePath, verbose, quiet, engineOverride, "")
+}
+
+func compileWorkflowWithActionRef(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride, actionRef string) error {
+	return compileWorkflowWithRefreshAndActionRef(ctx, filePath, verbose, quiet, engineOverride, actionRef, false, false)
+}
+
+func compileWorkflowWithRefreshAndActionRef(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride, actionRef string, refreshStopTime bool, approve bool) error {
+	addWorkflowCompilationLog.Printf("Compiling workflow: file=%s, refresh_stop_time=%v, engine=%s, approve=%v", filePath, refreshStopTime, engineOverride, approve)
+
+	// Create compiler with auto-detected version and action mode
+	compiler := workflow.NewCompiler(
+		workflow.WithVerbose(verbose),
+		workflow.WithEngineOverride(engineOverride),
+		workflow.WithLint(true),
+	)
+	applyAddActionRef(compiler, actionRef)
+
+	compiler.SetRefreshStopTime(refreshStopTime)
+	compiler.SetApprove(approve)
+	compiler.SetQuiet(quiet)
+	if err := CompileWorkflowWithValidation(ctx, compiler, filePath, CompileValidationOptions{Verbose: verbose, NoEmit: compiler.IsNoEmit()}); err != nil {
+		addWorkflowCompilationLog.Printf("Compilation failed: %v", err)
+		return err
+	}
+
+	addWorkflowCompilationLog.Print("Compilation completed successfully")
+
+	// Ensure .gitattributes marks .lock.yml files as generated
+	if _, err := ensureGitAttributes(); err != nil {
+		addWorkflowCompilationLog.Printf("Failed to update .gitattributes: %v", err)
+		if verbose {
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update .gitattributes: %v", err)))
+		}
+	}
+
+	// Note: Instructions are only written when explicitly requested via the compile command flag
+	// This helper function is used in contexts where instructions should not be automatically written
+
+	return nil
+}
+
+type trackedWorkflowCompileOptions struct {
+	verbose, quiet  bool
+	engineOverride  string
+	actionRef       string
+	tracker         *FileTracker
+	refreshStopTime bool
+	noGitattributes bool
+}
+
+// compileWorkflowWithTrackingAndOptions compiles a workflow, tracks generated files, and optionally refreshes stop time.
+func compileWorkflowWithTrackingAndOptions(ctx context.Context, filePath string, opts trackedWorkflowCompileOptions) error {
+	addWorkflowCompilationLog.Printf("Compiling workflow with tracking: file=%s, refresh_stop_time=%v", filePath, opts.refreshStopTime)
+
+	// Generate the expected lock file path
+	lockFile := stringutil.MarkdownToLockFile(filePath)
+
+	// Check if lock file exists before compilation
+	lockFileExists := fileutil.FileExists(lockFile)
+
+	addWorkflowCompilationLog.Printf("Lock file %s exists: %v", lockFile, lockFileExists)
+
+	// Check if .gitattributes exists before compilation so we know whether to
+	// use TrackCreated or TrackModified if ensureGitAttributes modifies it later.
+	gitRoot, gitRootErr := gitutil.FindGitRoot()
+	gitAttributesPath := ""
+	gitAttributesExisted := false
+	if gitRootErr == nil {
+		gitAttributesPath = filepath.Join(gitRoot, ".gitattributes")
+		gitAttributesExisted = fileutil.FileExists(gitAttributesPath)
+	}
+
+	// Track the lock file before compilation
+	if lockFileExists {
+		opts.tracker.TrackModified(lockFile)
+	} else {
+		opts.tracker.TrackCreated(lockFile)
+	}
+
+	// Create compiler with auto-detected version and action mode
+	compiler := workflow.NewCompiler(
+		workflow.WithVerbose(opts.verbose),
+		workflow.WithEngineOverride(opts.engineOverride),
+		workflow.WithLint(true),
+	)
+	applyAddActionRef(compiler, opts.actionRef)
+	compiler.SetFileTracker(opts.tracker)
+	compiler.SetRefreshStopTime(opts.refreshStopTime)
+	compiler.SetQuiet(opts.quiet)
+	if err := CompileWorkflowWithValidation(ctx, compiler, filePath, CompileValidationOptions{Verbose: opts.verbose, NoEmit: compiler.IsNoEmit()}); err != nil {
+		return err
+	}
+
+	// Ensure .gitattributes marks .lock.yml files as generated; only track it if it was actually
+	// modified. Errors here are non-fatal — gitattributes update failure does not prevent the
+	// compiled workflow from being usable.
+	if !opts.noGitattributes {
+		if updated, err := ensureGitAttributes(); err != nil {
+			if opts.verbose {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update .gitattributes: %v", err)))
+			}
+		} else if updated && gitRootErr == nil {
+			if gitAttributesExisted {
+				opts.tracker.TrackModified(gitAttributesPath)
+			} else {
+				opts.tracker.TrackCreated(gitAttributesPath)
+			}
+		}
+	}
+
+	return nil
+}
+
+// compileDepsOptions holds shared compilation options for dependency compilation helpers.
+type compileDepsOptions struct {
+	verbose, quiet  bool
+	engineOverride  string
+	actionRef       string
+	force           bool
+	propagateErrors bool
+	tracker         *FileTracker
+	noGitattributes bool
+}
+
+func compileDispatchWorkflowDependenciesWithOptions(ctx context.Context, workflowFile string, opts compileDepsOptions) {
+	opts.propagateErrors = false
+	if err := compileSafeOutputsWorkflowDependencies(ctx, workflowFile, "dispatch-workflow dependency", dispatchWorkflowNamesForCompilation, opts); err != nil {
+		addWorkflowCompilationLog.Printf("Failed to compile dispatch workflow dependencies: %v", err)
+	}
+}
+
+func compileCallWorkflowDependenciesWithOptions(ctx context.Context, workflowFile string, opts compileDepsOptions) error {
+	return compileSafeOutputsWorkflowDependencies(ctx, workflowFile, "call-workflow worker", callWorkflowNamesForCompilation, opts)
+}
+
+// compileSafeOutputsWorkflowDependencies is the shared implementation for compiling
+// local .md worker/dependency files referenced by a workflow. namesFunc extracts the
+// list of referenced workflow names from workflowFile; label is used in log/console
+// messages to identify the dependency type (e.g. "dispatch-workflow dependency").
+// When opts.propagateErrors is true the first compilation failure is returned to the
+// caller instead of being logged and swallowed.
+// When opts.force is true, dependencies are recompiled even when a .lock.yml already
+// exists (needed after --force re-fetches a stale worker .md).
+func compileSafeOutputsWorkflowDependencies(ctx context.Context, workflowFile, label string, namesFunc func(string) []string, opts compileDepsOptions) error {
+	workflowNames := namesFunc(workflowFile)
+	if len(workflowNames) == 0 {
+		return nil
+	}
+	if opts.tracker == nil {
+		opts.tracker = NewFileTracker()
+	}
+
+	workflowsDir := filepath.Dir(workflowFile)
+	addWorkflowCompilationLog.Printf("Resolved %d %s name(s) for %s", len(workflowNames), label, workflowFile)
+
+	for _, name := range workflowNames {
+		mdPath := filepath.Join(workflowsDir, name+".md")
+		lockPath := stringutil.MarkdownToLockFile(mdPath)
+
+		// Skip if the .md is not present locally.
+		if _, mdErr := os.Stat(mdPath); mdErr != nil {
+			addWorkflowCompilationLog.Printf("Skipping %s %s: markdown file not found locally", label, mdPath)
+			continue
+		}
+		// Skip recompilation when a lock already exists, unless --force was specified.
+		if !opts.force && fileutil.FileExists(lockPath) {
+			addWorkflowCompilationLog.Printf("Skipping %s %s: lock file already exists (force=%v)", label, mdPath, opts.force)
+			continue
+		}
+
+		addWorkflowCompilationLog.Printf("Compiling %s: %s", label, mdPath)
+		if opts.verbose {
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Compiling %s: %s", label, mdPath)))
+		}
+
+		compileErr := compileWorkflowWithTrackingAndOptions(ctx, mdPath, trackedWorkflowCompileOptions{
+			verbose: opts.verbose, quiet: opts.quiet, engineOverride: opts.engineOverride, actionRef: opts.actionRef,
+			tracker: opts.tracker, noGitattributes: opts.noGitattributes,
+		})
+		if compileErr != nil {
+			if opts.propagateErrors {
+				return fmt.Errorf("failed to compile %s %s: %w", label, mdPath, compileErr)
+			}
+			// Best-effort: log and continue so the main workflow can still give a clear error.
+			if opts.verbose {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to compile %s %s: %v", label, mdPath, compileErr)))
+			}
+		}
+	}
+	return nil
+}
+
+func applyAddActionRef(compiler *workflow.Compiler, actionRef string) {
+	if actionRef == "" {
+		return
+	}
+	compiler.SetActionMode(workflow.ActionModeRelease)
+	compiler.SetActionTag(actionRef)
+}
+
+func callWorkflowNamesForCompilation(workflowFile string) []string {
+	return safeOutputsWorkflowNamesForCompilation(workflowFile, "call-workflow", func(data *workflow.WorkflowData) []string {
+		if data.SafeOutputs.CallWorkflow == nil {
+			return nil
+		}
+		return data.SafeOutputs.CallWorkflow.Workflows
+	})
+}
+
+// extractSafeOutputsNamesFromFrontmatter reads workflowFile and extracts workflow names from
+// the named key under safe-outputs. It handles both array and map (with a "workflows" field)
+// forms of the configuration.
+func extractSafeOutputsNamesFromFrontmatter(workflowFile, safeOutputsKey string) []string {
+	content, err := os.ReadFile(workflowFile)
+	if err != nil {
+		return nil
+	}
+
+	frontmatter, err := parser.ExtractFrontmatterFromContent(string(content))
+	if err != nil || frontmatter == nil {
+		return nil
+	}
+
+	safeOutputs, ok := frontmatter.Frontmatter["safe-outputs"].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	configVal, exists := safeOutputs[safeOutputsKey]
+	if !exists {
+		return nil
+	}
+
+	var names []string
+	switch config := configVal.(type) {
+	case []any:
+		names = appendDispatchWorkflowNames(names, config)
+	case map[string]any:
+		if workflows, ok := config["workflows"].([]any); ok {
+			names = appendDispatchWorkflowNames(names, workflows)
+		}
+	}
+
+	return dedupeDispatchWorkflowNames(names)
+}
+
+func dispatchWorkflowNamesForCompilation(workflowFile string) []string {
+	return safeOutputsWorkflowNamesForCompilation(workflowFile, "dispatch-workflow", func(data *workflow.WorkflowData) []string {
+		if data.SafeOutputs.DispatchWorkflow == nil {
+			return nil
+		}
+		return data.SafeOutputs.DispatchWorkflow.Workflows
+	})
+}
+
+// safeOutputsWorkflowNamesForCompilation is the shared implementation for resolving
+// the list of workflow names that need pre-compilation. It first tries to parse the
+// workflow file with the compiler (which merges imports), then falls back to raw
+// frontmatter extraction when the file cannot be fully parsed. safeOutputsKey is
+// used in the fallback log message; getWorkflows selects the relevant workflow list
+// from the parsed safe-outputs data.
+func safeOutputsWorkflowNamesForCompilation(workflowFile, safeOutputsKey string, getWorkflows func(*workflow.WorkflowData) []string) []string {
+	compiler := workflow.NewCompiler()
+	data, err := compiler.ParseWorkflowFile(workflowFile)
+	if err == nil && data != nil && data.SafeOutputs != nil {
+		if names := dedupeDispatchWorkflowNames(getWorkflows(data)); len(names) > 0 {
+			return names
+		}
+	}
+
+	if err != nil {
+		var sharedErr *workflow.SharedWorkflowError
+		var redirectErr *workflow.RedirectOnlyWorkflowError
+		if !errors.As(err, &sharedErr) && !errors.As(err, &redirectErr) {
+			addWorkflowCompilationLog.Printf("Falling back to raw %s extraction for %s after parse error: %v", safeOutputsKey, workflowFile, err)
+		}
+	}
+
+	return extractSafeOutputsNamesFromFrontmatter(workflowFile, safeOutputsKey)
+}
+
+func appendDispatchWorkflowNames(names []string, raw []any) []string {
+	for _, candidate := range raw {
+		name, ok := candidate.(string)
+		if !ok {
+			continue
+		}
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		names = append(names, trimmed)
+	}
+	return names
+}
+
+func dedupeDispatchWorkflowNames(names []string) []string {
+	seen := make(map[string]struct{}, len(names))
+	result := make([]string, 0, len(names))
+	for _, name := range names {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := seen[trimmed]; exists {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+// This function preserves the existing frontmatter formatting while adding the source field.
+func addSourceToWorkflow(content, source string) (string, error) {
+	// Use shared frontmatter logic that preserves formatting
+	return addFieldToFrontmatter(content, "source", source, false)
+}
+
+// addEngineToWorkflow adds or updates the engine field in the workflow's frontmatter.
+// This function preserves the existing frontmatter formatting while setting the engine field.
+// A trailing blank line is added after the engine declaration to visually separate it from
+// the source field that follows, preventing adjacent-line merge conflicts during updates.
+func addEngineToWorkflow(content, engine string) (string, error) {
+	// Use shared frontmatter logic that preserves formatting; trailing blank line separates
+	// the engine declaration from the source field added immediately after.
+	return addFieldToFrontmatter(content, "engine", engine, true)
+}

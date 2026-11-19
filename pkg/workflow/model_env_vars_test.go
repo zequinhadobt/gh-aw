@@ -1,0 +1,953 @@
+//go:build !integration
+
+package workflow
+
+import (
+	"encoding/json"
+	"maps"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
+	"github.com/goccy/go-yaml"
+	"github.com/stretchr/testify/require"
+)
+
+// TestModelEnvVarInjectionForAgentJob tests that agent jobs get the correct model environment variable
+func TestModelEnvVarInjectionForAgentJob(t *testing.T) {
+	tests := []struct {
+		name                    string
+		engine                  string
+		expectedEnvVar          string
+		expectedCommand         string
+		expectedDefault         string
+		expectedDefaultOverride string
+	}{
+		{
+			name:                    "Claude agent uses GH_AW_MODEL_AGENT_CLAUDE",
+			engine:                  "claude",
+			expectedEnvVar:          constants.EnvVarModelAgentClaude,
+			expectedCommand:         "${" + constants.EnvVarModelAgentClaude + ":+ --model",
+			expectedDefault:         constants.SonnetDefaultModel,
+			expectedDefaultOverride: compilerenv.DefaultModelClaude,
+		},
+		{
+			name:                    "Codex agent uses GH_AW_MODEL_AGENT_CODEX",
+			engine:                  "codex",
+			expectedEnvVar:          constants.EnvVarModelAgentCodex,
+			expectedCommand:         "${" + constants.EnvVarModelAgentCodex + `:+ --model "`,
+			expectedDefault:         constants.CodexDefaultModel,
+			expectedDefaultOverride: compilerenv.DefaultModelCodex,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a simple workflow with the specified engine
+			// Add SafeOutputs to distinguish from detection jobs
+			workflowData := &WorkflowData{
+				Name: "test-workflow",
+				AI:   tt.engine,
+				Tools: map[string]any{
+					"bash": []any{"echo"},
+				},
+				SafeOutputs: &SafeOutputsConfig{
+					// Just enough to make it an agent job
+				},
+			}
+
+			// Get the engine
+			engine, err := GetGlobalEngineRegistry().GetEngine(tt.engine)
+			if err != nil {
+				t.Fatalf("Failed to get engine: %v", err)
+			}
+
+			// Get execution steps
+			steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
+
+			// Convert steps to string for analysis
+			var stepsStr strings.Builder
+			for _, step := range steps {
+				for _, line := range step {
+					stepsStr.WriteString(line)
+					stepsStr.WriteString("\n")
+				}
+			}
+			stepsContent := stepsStr.String()
+
+			// Check that the environment variable is present
+			if !strings.Contains(stepsContent, tt.expectedEnvVar+":") {
+				t.Errorf("Expected environment variable %s not found in steps:\n%s", tt.expectedEnvVar, stepsContent)
+			}
+
+			// Check that the command uses the env var conditionally
+			if !strings.Contains(stepsContent, tt.expectedCommand) {
+				t.Errorf("Expected command pattern '%s' not found in steps:\n%s", tt.expectedCommand, stepsContent)
+			}
+
+			// Verify env var has the correct fallback value
+			var expectedEnvLine string
+			if tt.expectedDefault != "" {
+				expectedEnvLine = tt.expectedEnvVar + ": ${{ vars." + tt.expectedEnvVar + " || vars." + tt.expectedDefaultOverride + " || '" + tt.expectedDefault + "' }}"
+			} else {
+				expectedEnvLine = tt.expectedEnvVar + ": ${{ vars." + tt.expectedEnvVar + " || vars." + tt.expectedDefaultOverride + " || '' }}"
+			}
+			if !strings.Contains(stepsContent, expectedEnvLine) {
+				t.Errorf("Expected env var line '%s' not found in steps:\n%s", expectedEnvLine, stepsContent)
+			}
+		})
+	}
+}
+
+// TestModelEnvVarInjectionForDetectionJob tests that detection jobs get the correct model environment variable
+func TestModelEnvVarInjectionForDetectionJob(t *testing.T) {
+	tests := []struct {
+		name                    string
+		engine                  string
+		expectedEnvVar          string
+		expectedDefault         string
+		expectedDefaultOverride string
+	}{
+		{
+			name:                    "Claude detection uses GH_AW_MODEL_DETECTION_CLAUDE",
+			engine:                  "claude",
+			expectedEnvVar:          constants.EnvVarModelDetectionClaude,
+			expectedDefault:         constants.SonnetDefaultModel,
+			expectedDefaultOverride: compilerenv.DefaultModelClaude,
+		},
+		{
+			name:                    "Codex detection uses GH_AW_MODEL_DETECTION_CODEX",
+			engine:                  "codex",
+			expectedEnvVar:          constants.EnvVarModelDetectionCodex,
+			expectedDefault:         constants.CodexDefaultModel,
+			expectedDefaultOverride: compilerenv.DefaultModelCodex,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a minimal detection workflow (no SafeOutputs)
+			workflowData := &WorkflowData{
+				Name:        "test-detection",
+				AI:          tt.engine,
+				SafeOutputs: nil, // This makes it a detection job
+				Tools: map[string]any{
+					"bash": []any{"cat", "grep"},
+				},
+			}
+
+			// Get the engine
+			engine, err := GetGlobalEngineRegistry().GetEngine(tt.engine)
+			if err != nil {
+				t.Fatalf("Failed to get engine: %v", err)
+			}
+
+			// Get execution steps
+			steps := engine.GetExecutionSteps(workflowData, "/tmp/detection.log")
+
+			// Convert steps to string for analysis
+			var stepsStr strings.Builder
+			for _, step := range steps {
+				for _, line := range step {
+					stepsStr.WriteString(line)
+					stepsStr.WriteString("\n")
+				}
+			}
+			stepsContent := stepsStr.String()
+
+			// Check that the environment variable is present
+			if !strings.Contains(stepsContent, tt.expectedEnvVar+":") {
+				t.Errorf("Expected environment variable %s not found in detection steps:\n%s", tt.expectedEnvVar, stepsContent)
+			}
+
+			// For Copilot, verify it has the default detection model as fallback
+			if tt.expectedDefault != "" {
+				expectedEnvLine := tt.expectedEnvVar + ": ${{ vars." + tt.expectedEnvVar + " || vars." + tt.expectedDefaultOverride + " || '" + tt.expectedDefault + "' }}"
+				if !strings.Contains(stepsContent, expectedEnvLine) {
+					t.Errorf("Expected env var line with default '%s' not found in steps:\n%s", expectedEnvLine, stepsContent)
+				}
+			} else {
+				// For engines without a built-in model, leave selection to the runtime
+				expectedEnvLine := tt.expectedEnvVar + ": ${{ vars." + tt.expectedEnvVar + " || vars." + tt.expectedDefaultOverride + " || '' }}"
+				if !strings.Contains(stepsContent, expectedEnvLine) {
+					t.Errorf("Expected env var line '%s' not found in steps:\n%s", expectedEnvLine, stepsContent)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeEvalsModelEnvVarInjectionForEvalsPhase(t *testing.T) {
+	engine, err := GetGlobalEngineRegistry().GetEngine("claude")
+	if err != nil {
+		t.Fatalf("Failed to get engine: %v", err)
+	}
+
+	t.Run("unset model uses GH_AW_MODEL_EVALS_CLAUDE fallback", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name:       "test-evals-claude",
+			AI:         "claude",
+			IsEvalsRun: true,
+			Tools: map[string]any{
+				"bash": []any{"echo"},
+			},
+		}
+
+		steps := engine.GetExecutionSteps(workflowData, "/tmp/evals.log")
+		var stepsStr strings.Builder
+		for _, step := range steps {
+			for _, line := range step {
+				stepsStr.WriteString(line)
+				stepsStr.WriteString("\n")
+			}
+		}
+		stepsContent := stepsStr.String()
+
+		expectedEnvLine := constants.EnvVarModelEvalsClaude + ": ${{ vars." + constants.EnvVarModelEvalsClaude + " || vars." + compilerenv.DefaultModelClaude + " || '" + constants.SonnetDefaultModel + "' }}"
+		if !strings.Contains(stepsContent, expectedEnvLine) {
+			t.Errorf("Expected evals env var line '%s' not found in steps:\n%s", expectedEnvLine, stepsContent)
+		}
+		if strings.Contains(stepsContent, constants.EnvVarModelAgentClaude+":") {
+			t.Errorf("Agent model env var %s should not be present in evals phase:\n%s", constants.EnvVarModelAgentClaude, stepsContent)
+		}
+	})
+
+	t.Run("expression model uses evals fallback env", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name:       "test-evals-expression-claude",
+			AI:         "claude",
+			IsEvalsRun: true,
+			Model:      "${{ inputs.model }}",
+			Tools: map[string]any{
+				"bash": []any{"echo"},
+			},
+		}
+
+		steps := engine.GetExecutionSteps(workflowData, "/tmp/evals-expression.log")
+		var stepsStr strings.Builder
+		for _, step := range steps {
+			for _, line := range step {
+				stepsStr.WriteString(line)
+				stepsStr.WriteString("\n")
+			}
+		}
+		stepsContent := stepsStr.String()
+
+		expectedFallbackLine := constants.EnvVarModelFallback + ": ${{ vars." + constants.EnvVarModelEvalsClaude + " || vars." + compilerenv.DefaultModelClaude + " || '" + constants.SonnetDefaultModel + "' }}"
+		if !strings.Contains(stepsContent, expectedFallbackLine) {
+			t.Errorf("Expected evals fallback env line '%s' not found in steps:\n%s", expectedFallbackLine, stepsContent)
+		}
+	})
+}
+
+// TestExplicitModelConfigOverridesEnvVar tests that explicit model configuration takes precedence
+func TestExplicitModelConfigOverridesEnvVar(t *testing.T) {
+	workflowData := &WorkflowData{
+		Name:  "test-explicit-model",
+		AI:    "copilot",
+		Model: "gpt-4",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+		},
+		Tools: map[string]any{
+			"bash": []any{"echo"},
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			// Just enough to make it an agent job
+		},
+	}
+
+	engine, err := GetGlobalEngineRegistry().GetEngine("copilot")
+	if err != nil {
+		t.Fatalf("Failed to get engine: %v", err)
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
+
+	// Convert steps to string
+	var stepsStr strings.Builder
+	for _, step := range steps {
+		for _, line := range step {
+			stepsStr.WriteString(line)
+			stepsStr.WriteString("\n")
+		}
+	}
+	stepsContent := stepsStr.String()
+
+	// When model is explicitly configured, the GH_AW_ fallback env var should NOT be present
+	if strings.Contains(stepsContent, constants.EnvVarModelAgentCopilot+":") {
+		t.Errorf("Fallback env var %s should not be present when model is explicitly configured", constants.EnvVarModelAgentCopilot)
+	}
+	if strings.Contains(stepsContent, constants.EnvVarModelFallback+":") {
+		t.Errorf("Fallback env var %s should not be present for a literal configured model", constants.EnvVarModelFallback)
+	}
+
+	// The model should be passed via the native COPILOT_MODEL env var (not via --model flag)
+	expectedEnvLine := constants.CopilotCLIModelEnvVar + ": gpt-4"
+	if !strings.Contains(stepsContent, expectedEnvLine) {
+		t.Errorf("Expected native env var line '%s' not found in steps:\n%s", expectedEnvLine, stepsContent)
+	}
+
+	// The --model flag should NOT appear in the shell command (model is via env var)
+	if strings.Contains(stepsContent, "--model gpt-4") {
+		t.Errorf("--model flag should not be in command when model is set via native env var:\n%s", stepsContent)
+	}
+}
+
+// TestAutoModelPassedToCopilotAsIs tests that model: auto is passed to the Copilot CLI
+// via COPILOT_MODEL=auto without any transformation or fallback env var.
+func TestAutoModelPassedToCopilotAsIs(t *testing.T) {
+	workflowData := &WorkflowData{
+		Name:  "test-auto-model",
+		AI:    "copilot",
+		Model: "auto",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+		},
+		Tools: map[string]any{
+			"bash": []any{"echo"},
+		},
+		SafeOutputs: &SafeOutputsConfig{},
+	}
+
+	engine, err := GetGlobalEngineRegistry().GetEngine("copilot")
+	if err != nil {
+		t.Fatalf("Failed to get engine: %v", err)
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "/tmp/test-auto.log")
+
+	var stepsStr strings.Builder
+	for _, step := range steps {
+		for _, line := range step {
+			stepsStr.WriteString(line)
+			stepsStr.WriteString("\n")
+		}
+	}
+	stepsContent := stepsStr.String()
+
+	// "auto" is a native Copilot model ID and must be passed as-is via COPILOT_MODEL
+	expectedEnvLine := constants.CopilotCLIModelEnvVar + ": auto"
+	if !strings.Contains(stepsContent, expectedEnvLine) {
+		t.Errorf("Expected '%s' not found in steps (auto must be passed as-is to Copilot):\n%s", expectedEnvLine, stepsContent)
+	}
+
+	// No fallback env var should be set for a literal model like "auto"
+	if strings.Contains(stepsContent, constants.EnvVarModelFallback+":") {
+		t.Errorf("Fallback env var %s should not be present for literal model 'auto'", constants.EnvVarModelFallback)
+	}
+
+	// "auto" should not appear as a --model CLI flag
+	if strings.Contains(stepsContent, "--model auto") {
+		t.Errorf("--model flag should not be used; model must be passed via COPILOT_MODEL:\n%s", stepsContent)
+	}
+}
+
+// TestAutoModelFallbackForNonCopilotEngine verifies that the "auto" alias provides a
+// provider-agnostic fallback path for non-Copilot engines. For a Claude workflow with
+// model: auto, the alias map must route through "large" (a provider-agnostic alias) and
+// must not expose "copilot/auto" as a reachable model in the large fallback chain.
+func TestAutoModelFallbackForNonCopilotEngine(t *testing.T) {
+	workflowData := &WorkflowData{
+		Name:  "test-auto-claude",
+		AI:    "claude",
+		Model: "auto",
+		EngineConfig: &EngineConfig{
+			ID: "claude",
+		},
+		Tools: map[string]any{
+			"bash": []any{"echo"},
+		},
+		SafeOutputs:   &SafeOutputsConfig{},
+		ModelMappings: MergeImportedModelAliases(nil, nil),
+	}
+
+	// "auto" must include "large" as the non-Copilot fallback entry
+	autoResolution := workflowData.ModelMappings["auto"]
+	if len(autoResolution) == 0 {
+		t.Fatal("auto alias must be present in ModelMappings")
+	}
+	foundLarge := false
+	for _, m := range autoResolution {
+		if m == "large" {
+			foundLarge = true
+		}
+	}
+	if !foundLarge {
+		t.Errorf("auto alias must include 'large' as a non-Copilot fallback; got %v", autoResolution)
+	}
+
+	// "large" must not contain copilot-specific entries — it is the provider-agnostic fallback
+	largeResolution := workflowData.ModelMappings["large"]
+	if len(largeResolution) == 0 {
+		t.Fatal("large alias must be present in ModelMappings")
+	}
+	for _, m := range largeResolution {
+		if strings.HasPrefix(m, "copilot/") {
+			t.Errorf("large alias must not contain Copilot-specific models; found %q in large: %v", m, largeResolution)
+		}
+	}
+}
+
+// TestCopilotFallbackModelMapsToNativeEnvVar tests that when model is not explicitly configured,
+// the Copilot engine maps the GitHub org variable to the native COPILOT_MODEL env var instead
+// of using the broken --model CLI flag.
+func TestCopilotFallbackModelMapsToNativeEnvVar(t *testing.T) {
+	tests := []struct {
+		name           string
+		safeOutputs    *SafeOutputsConfig
+		expectedOrgVar string
+		features       map[string]any
+		expectedTail   string
+	}{
+		{
+			name:           "Agent job maps GH_AW_MODEL_AGENT_COPILOT to COPILOT_MODEL",
+			safeOutputs:    &SafeOutputsConfig{},
+			expectedOrgVar: constants.EnvVarModelAgentCopilot,
+			expectedTail:   "vars." + compilerenv.DefaultModelCopilot + " || '" + constants.CopilotBYOKDefaultModel + "'",
+		},
+		{
+			name:           "Detection job maps GH_AW_MODEL_DETECTION_COPILOT to COPILOT_MODEL",
+			safeOutputs:    nil,
+			expectedOrgVar: constants.EnvVarModelDetectionCopilot,
+			expectedTail:   "vars." + compilerenv.DefaultModelCopilot + " || '" + constants.CopilotBYOKDefaultModel + "'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflowData := &WorkflowData{
+				Name: "test-workflow",
+				AI:   "copilot",
+				Tools: map[string]any{
+					"bash": []any{"echo"},
+				},
+				SafeOutputs: tt.safeOutputs,
+				Features:    tt.features,
+			}
+
+			engine, err := GetGlobalEngineRegistry().GetEngine("copilot")
+			if err != nil {
+				t.Fatalf("Failed to get engine: %v", err)
+			}
+
+			steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
+
+			var stepsStr strings.Builder
+			for _, step := range steps {
+				for _, line := range step {
+					stepsStr.WriteString(line)
+					stepsStr.WriteString("\n")
+				}
+			}
+			stepsContent := stepsStr.String()
+
+			// The model must be passed via COPILOT_MODEL env var pointing to the org variable
+			expectedEnvLine := constants.CopilotCLIModelEnvVar + ": ${{ vars." + tt.expectedOrgVar + " || " + tt.expectedTail + " }}"
+			if !strings.Contains(stepsContent, expectedEnvLine) {
+				t.Errorf("Expected env line '%s' not found in steps:\n%s", expectedEnvLine, stepsContent)
+			}
+
+			// The --model flag must NOT appear in the shell command
+			if strings.Contains(stepsContent, "--model") {
+				t.Errorf("--model flag should not appear in command (model is passed via COPILOT_MODEL env var):\n%s", stepsContent)
+			}
+
+			// The org variable must NOT appear as its own env block key
+			if strings.Contains(stepsContent, tt.expectedOrgVar+":") {
+				t.Errorf("Org var %s should not appear as env block key (only as value in COPILOT_MODEL):\n%s", tt.expectedOrgVar, stepsContent)
+			}
+		})
+	}
+}
+
+// TestExpressionModelUsesEnvVar tests that when model is a GitHub Actions expression,
+// it is set as an environment variable rather than embedded directly in the shell command.
+// This prevents template injection validation failures.
+func TestExpressionModelUsesEnvVar(t *testing.T) {
+	tests := []struct {
+		name                 string
+		engine               string
+		model                string
+		expectedModelEnvVar  string
+		expectedModelEnvVal  string
+		expectedFallbackVal  string
+		additionalModelEnv   []string
+		expectShellExpansion bool // whether command should use ${VAR:+ --model "$VAR"}
+	}{
+		{
+			name:                 "Copilot agent keeps pure expression model and adds JS fallback env",
+			engine:               "copilot",
+			model:                "${{ inputs.model }}",
+			expectedModelEnvVar:  constants.CopilotCLIModelEnvVar,
+			expectedModelEnvVal:  "${{ inputs.model }}",
+			expectedFallbackVal:  "${{ vars." + constants.EnvVarModelAgentCopilot + " || vars." + compilerenv.DefaultModelCopilot + " || '" + constants.CopilotBYOKDefaultModel + "' }}",
+			expectShellExpansion: false, // Copilot reads COPILOT_MODEL natively, no shell expansion needed
+		},
+		{
+			name:                 "Copilot agent keeps composite expression model and adds JS fallback env",
+			engine:               "copilot",
+			model:                "${{ inputs.provider }}/${{ inputs.model }}",
+			expectedModelEnvVar:  constants.CopilotCLIModelEnvVar,
+			expectedModelEnvVal:  "${{ inputs.provider }}/${{ inputs.model }}",
+			expectedFallbackVal:  "${{ vars." + constants.EnvVarModelAgentCopilot + " || vars." + compilerenv.DefaultModelCopilot + " || '" + constants.CopilotBYOKDefaultModel + "' }}",
+			expectShellExpansion: false,
+		},
+		{
+			name:                 "Claude agent keeps expression model and adds JS fallback env",
+			engine:               "claude",
+			model:                "${{ inputs.model }}",
+			expectedModelEnvVar:  constants.ClaudeCLIModelEnvVar,
+			expectedModelEnvVal:  "${{ inputs.model }}",
+			expectedFallbackVal:  "${{ vars." + constants.EnvVarModelAgentClaude + " || vars." + compilerenv.DefaultModelClaude + " || '" + constants.SonnetDefaultModel + "' }}",
+			expectShellExpansion: false, // Claude reads ANTHROPIC_MODEL natively, no shell expansion needed
+		},
+		{
+			name:                 "Claude agent keeps composite expression model and adds JS fallback env",
+			engine:               "claude",
+			model:                "${{ inputs.provider }}/${{ inputs.model }}",
+			expectedModelEnvVar:  constants.ClaudeCLIModelEnvVar,
+			expectedModelEnvVal:  "${{ inputs.provider }}/${{ inputs.model }}",
+			expectedFallbackVal:  "${{ vars." + constants.EnvVarModelAgentClaude + " || vars." + compilerenv.DefaultModelClaude + " || '" + constants.SonnetDefaultModel + "' }}",
+			expectShellExpansion: false,
+		},
+		{
+			name:                 "Codex agent keeps composite expression model and adds JS fallback env",
+			engine:               "codex",
+			model:                "${{ inputs.provider }}/${{ inputs.model }}",
+			expectedModelEnvVar:  constants.EnvVarModelAgentCodex,
+			expectedModelEnvVal:  "${{ inputs.provider }}/${{ inputs.model }}",
+			expectedFallbackVal:  "${{ vars." + constants.EnvVarModelAgentCodex + " || vars." + compilerenv.DefaultModelCodex + " || '' }}",
+			expectShellExpansion: true, // Codex has no native model env var, uses shell expansion
+		},
+		{
+			name:                "Gemini agent passes expression model through its native env",
+			engine:              "gemini",
+			model:               "${{ inputs.model }}",
+			expectedModelEnvVar: constants.GeminiCLIModelEnvVar,
+			expectedModelEnvVal: "${{ inputs.model }}",
+		},
+		{
+			name:                "Agy agent passes expression model through its native env",
+			engine:              "agy",
+			model:               "${{ inputs.model }}",
+			expectedModelEnvVar: "GH_AW_AGY_MODEL",
+			expectedModelEnvVal: "${{ inputs.model }}",
+		},
+		{
+			name:                "Pi agent passes expression model through its runtime env",
+			engine:              "pi",
+			model:               "copilot/${{ inputs.model }}",
+			expectedModelEnvVar: "GH_AW_PI_MODEL",
+			expectedModelEnvVal: "copilot/${{ inputs.model }}",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflowData := &WorkflowData{
+				Name:  "test-expression-model",
+				AI:    tt.engine,
+				Model: tt.model,
+				EngineConfig: &EngineConfig{
+					ID: tt.engine,
+				},
+				Tools: map[string]any{
+					"bash": []any{"echo"},
+				},
+				SafeOutputs: &SafeOutputsConfig{},
+			}
+
+			engine, err := GetGlobalEngineRegistry().GetEngine(tt.engine)
+			if err != nil {
+				t.Fatalf("Failed to get engine: %v", err)
+			}
+
+			steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
+
+			var stepsStr strings.Builder
+			for _, step := range steps {
+				for _, line := range step {
+					stepsStr.WriteString(line)
+					stepsStr.WriteString("\n")
+				}
+			}
+			stepsContent := stepsStr.String()
+
+			var commandContent strings.Builder
+			for _, step := range steps {
+				inRunBlock := false
+				for _, line := range step {
+					switch strings.TrimSpace(line) {
+					case "run: |":
+						inRunBlock = true
+					case "env:":
+						inRunBlock = false
+					default:
+						if inRunBlock {
+							commandContent.WriteString(line)
+							commandContent.WriteString("\n")
+						}
+					}
+				}
+			}
+			if strings.Contains(commandContent.String(), tt.model) {
+				t.Errorf("Model expression should not be embedded directly in shell commands:\n%s", commandContent.String())
+			}
+
+			// The env var must be set to the expression value
+			expectedModelEnvLine := tt.expectedModelEnvVar + ": " + tt.expectedModelEnvVal
+			if !strings.Contains(stepsContent, expectedModelEnvLine) {
+				t.Errorf("Expected env line '%s' not found in steps:\n%s", expectedModelEnvLine, stepsContent)
+			}
+			if tt.expectedFallbackVal != "" {
+				expectedFallbackEnvLine := constants.EnvVarModelFallback + ": " + tt.expectedFallbackVal
+				if !strings.Contains(stepsContent, expectedFallbackEnvLine) {
+					t.Errorf("Expected fallback env line '%s' not found in steps:\n%s", expectedFallbackEnvLine, stepsContent)
+				}
+			}
+			for _, expectedEnvLine := range tt.additionalModelEnv {
+				if !strings.Contains(stepsContent, expectedEnvLine) {
+					t.Errorf("Expected model env line '%s' not found in steps:\n%s", expectedEnvLine, stepsContent)
+				}
+			}
+
+			// Check shell expansion expectation
+			shellExpansionPattern := "${" + tt.expectedModelEnvVar + ":+"
+			hasShellExpansion := strings.Contains(stepsContent, shellExpansionPattern)
+			if tt.expectShellExpansion && !hasShellExpansion {
+				t.Errorf("Expected conditional env var usage '${%s:+' not found in steps:\n%s", tt.expectedModelEnvVar, stepsContent)
+			} else if !tt.expectShellExpansion && hasShellExpansion {
+				t.Errorf("Unexpected conditional env var usage '${%s:+' found in steps (should use native env var):\n%s", tt.expectedModelEnvVar, stepsContent)
+			}
+		})
+	}
+}
+
+// TestExpressionModelDetectionJobUsesEnvVar tests that detection jobs with expression model
+// for Copilot use the native COPILOT_MODEL environment variable.
+func TestExpressionModelDetectionJobUsesEnvVar(t *testing.T) {
+	workflowData := &WorkflowData{
+		Name:  "test-detection-expression-model",
+		AI:    "copilot",
+		Model: "${{ inputs.model }}",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+		},
+		Tools: map[string]any{
+			"bash": []any{"cat", "grep"},
+		},
+		SafeOutputs: nil, // detection job
+	}
+
+	engine, err := GetGlobalEngineRegistry().GetEngine("copilot")
+	if err != nil {
+		t.Fatalf("Failed to get engine: %v", err)
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "/tmp/detection.log")
+
+	var stepsStr strings.Builder
+	for _, step := range steps {
+		for _, line := range step {
+			stepsStr.WriteString(line)
+			stepsStr.WriteString("\n")
+		}
+	}
+	stepsContent := stepsStr.String()
+
+	// Detection job for Copilot should keep the configured expression and expose the runtime fallback.
+	expectedModelEnvLine := constants.CopilotCLIModelEnvVar + ": ${{ inputs.model }}"
+	if !strings.Contains(stepsContent, expectedModelEnvLine) {
+		t.Errorf("Expected env line '%s' not found in steps:\n%s", expectedModelEnvLine, stepsContent)
+	}
+	expectedFallbackEnvLine := constants.EnvVarModelFallback + ": ${{ vars." + constants.EnvVarModelDetectionCopilot + " || vars." + compilerenv.DefaultModelCopilot + " || '" + constants.CopilotBYOKDefaultModel + "' }}"
+	if !strings.Contains(stepsContent, expectedFallbackEnvLine) {
+		t.Errorf("Expected fallback env line '%s' not found in steps:\n%s", expectedFallbackEnvLine, stepsContent)
+	}
+
+	// Must not embed expression directly in shell command
+	if strings.Contains(stepsContent, "--model ${{") {
+		t.Errorf("Model expression should not be embedded directly in shell command:\n%s", stepsContent)
+	}
+}
+
+// TestGetModelEnvVarName tests that engines return the correct native model env var name.
+func TestGetModelEnvVarName(t *testing.T) {
+	tests := []struct {
+		engine   string
+		expected string
+	}{
+		{"copilot", constants.CopilotCLIModelEnvVar}, // "COPILOT_MODEL"
+		{"claude", constants.ClaudeCLIModelEnvVar},   // "ANTHROPIC_MODEL"
+		{"codex", ""}, // no native model env var
+		{"gemini", constants.GeminiCLIModelEnvVar}, // "GEMINI_MODEL"
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.engine, func(t *testing.T) {
+			eng, err := GetGlobalEngineRegistry().GetEngine(tt.engine)
+			if err != nil {
+				t.Fatalf("Failed to get engine %s: %v", tt.engine, err)
+			}
+			provider, ok := eng.(ModelEnvVarProvider)
+			if !ok {
+				t.Fatalf("Engine %s does not implement ModelEnvVarProvider", tt.engine)
+			}
+			if got := provider.GetModelEnvVarName(); got != tt.expected {
+				t.Errorf("Engine %s: GetModelEnvVarName() = %q, want %q", tt.engine, got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestCodexModelFlagPositionAfterExec verifies that the --model flag appears after the exec
+// subcommand in the generated Codex command, not before it.
+// Regression test for: Codex lock compiler places --model flag before exec subcommand.
+func TestCodexModelFlagPositionAfterExec(t *testing.T) {
+	workflowData := &WorkflowData{
+		Name: "test-codex-model-position",
+		AI:   "codex",
+		Tools: map[string]any{
+			"bash": []any{"echo"},
+		},
+		SafeOutputs: &SafeOutputsConfig{},
+	}
+
+	engine, err := GetGlobalEngineRegistry().GetEngine("codex")
+	if err != nil {
+		t.Fatalf("Failed to get engine: %v", err)
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
+
+	var stepsStr strings.Builder
+	for _, step := range steps {
+		for _, line := range step {
+			stepsStr.WriteString(line)
+			stepsStr.WriteString("\n")
+		}
+	}
+	stepsContent := stepsStr.String()
+
+	// Find the model shell expansion pattern in the generated command
+	modelPattern := "${" + constants.EnvVarModelAgentCodex + ":+"
+	beforeModel, _, found := strings.Cut(stepsContent, modelPattern)
+	if !found {
+		t.Fatalf("Model expansion pattern '%s' not found in steps:\n%s", modelPattern, stepsContent)
+	}
+
+	// Find "codex exec" before the model pattern. Using "codex exec" (not just "exec") avoids
+	// false positives from unrelated occurrences like "GH_AW_NODE_EXEC" in the step content.
+	execMarker := "codex exec"
+	execIdx := strings.LastIndex(beforeModel, execMarker)
+	if execIdx == -1 {
+		t.Errorf("'codex exec' must appear before the model flag '%s' in the generated command.\n"+
+			"This indicates the model flag is placed before 'exec', causing Codex to ignore it.\n"+
+			"Got:\n%s", modelPattern, stepsContent)
+	}
+}
+
+type testExpressionValue struct {
+	value     string
+	isBoolean bool
+}
+
+func (v testExpressionValue) isTruthy() bool {
+	if v.isBoolean {
+		return v.value == "true"
+	}
+	return v.value != ""
+}
+
+// evaluateTestExpression evaluates the subset of Actions expressions the model
+// routing guards use: string literals, context references, groups, ==, !=, &&, ||.
+func evaluateTestExpression(t *testing.T, expr *actionslanguageservice.Expression, contexts map[string]string) testExpressionValue {
+	t.Helper()
+	switch expr.Kind {
+	case "literal":
+		value, _ := expr.Token.Value.(string)
+		return testExpressionValue{value: value}
+	case "group":
+		return evaluateTestExpression(t, expr.Child(0), contexts)
+	case "context", "index":
+		path, ok := actionslanguageservice.Reference(expr)
+		require.True(t, ok, "unsupported reference")
+		return testExpressionValue{value: contexts[strings.Join(path, ".")]}
+	case "binary":
+		left := evaluateTestExpression(t, expr.Child(0), contexts)
+		right := evaluateTestExpression(t, expr.Child(1), contexts)
+		equal := strings.EqualFold(left.value, right.value)
+		if expr.Token.Kind == "!=" {
+			equal = !equal
+		}
+		value := "false"
+		if equal {
+			value = "true"
+		}
+		return testExpressionValue{value: value, isBoolean: true}
+	case "logical":
+		var value testExpressionValue
+		for _, child := range expr.Children {
+			value = evaluateTestExpression(t, child, contexts)
+			if (expr.Token.Kind == "&&") == !value.isTruthy() {
+				return value
+			}
+		}
+		return value
+	}
+	t.Fatalf("unsupported expression kind %q", expr.Kind)
+	return testExpressionValue{}
+}
+
+func evaluateTestCondition(t *testing.T, expr string, contexts map[string]string) bool {
+	t.Helper()
+	parsed, err := actionslanguageservice.ParseSyntax(expr)
+	require.NoError(t, err)
+	return evaluateTestExpression(t, parsed, contexts).isTruthy()
+}
+
+// evaluateTestTemplate substitutes every ${{ }} interpolation in value.
+func evaluateTestTemplate(t *testing.T, value string, contexts map[string]string) string {
+	t.Helper()
+	for {
+		start := strings.Index(value, "${{")
+		if start < 0 {
+			return value
+		}
+		end := strings.Index(value[start:], "}}")
+		require.Positive(t, end)
+		expr, err := actionslanguageservice.ParseSyntax(strings.TrimSpace(value[start+3 : start+end]))
+		require.NoError(t, err)
+		value = value[:start] + evaluateTestExpression(t, expr, contexts).value + value[start+end+2:]
+	}
+}
+
+// TestDefaultModelRoutingActivationHonorsModelVariables runs the generated
+// activation decision step with stubbed Actions variables and evaluates the
+// downstream guarded model env, routing flag, conversation-step condition, and
+// AWF config branch, proving the runtime precedence is resolved before AWF starts.
+func TestDefaultModelRoutingActivationHonorsModelVariables(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	compiled := compileDefaultRoutingSource(t, "---\non: workflow_dispatch\npermissions:\n  contents: read\nengine: copilot\n---\nReport.\n")
+	require.NoError(t, compiled.err)
+
+	type step struct {
+		Name string            `yaml:"name"`
+		ID   string            `yaml:"id"`
+		If   string            `yaml:"if"`
+		Run  string            `yaml:"run"`
+		Env  map[string]string `yaml:"env"`
+	}
+	var lock struct {
+		Jobs map[string]struct {
+			Outputs map[string]string `yaml:"outputs"`
+			Steps   []step            `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(compiled.lock), &lock))
+	var decision, info, conversation, execution *step
+	for i, s := range lock.Jobs["activation"].Steps {
+		switch {
+		case s.ID == modelRoutingDecisionStepID:
+			decision = &lock.Jobs["activation"].Steps[i]
+		case s.Env["GH_AW_INFO_MODEL_CONFIG"] != "":
+			info = &lock.Jobs["activation"].Steps[i]
+		}
+	}
+	for i, s := range lock.Jobs["agent"].Steps {
+		switch {
+		case s.Name == "Prepare model-routing conversation":
+			conversation = &lock.Jobs["agent"].Steps[i]
+		case strings.Contains(s.Run, `awf --config "${RUNNER_TEMP}/gh-aw/awf-config.json"`):
+			execution = &lock.Jobs["agent"].Steps[i]
+		}
+	}
+	require.NotNil(t, decision, "activation decision step")
+	require.NotNil(t, info, "aw_info step")
+	require.NotNil(t, conversation, "conversation step")
+	require.NotNil(t, execution, "AWF execution step")
+	require.Equal(t, "${{ steps."+modelRoutingDecisionStepID+".outputs."+modelRoutingDecisionOutput+" }}", lock.Jobs["activation"].Outputs[modelRoutingDecisionOutput])
+
+	configStart := strings.Index(execution.Run, `if [ "${GH_AW_MODEL_ROUTING:-}" = "1" ]; then`)
+	require.GreaterOrEqual(t, configStart, 0)
+	configEnd := strings.Index(execution.Run[configStart:], "\nfi\n")
+	require.Positive(t, configEnd)
+	configScript := execution.Run[configStart : configStart+configEnd+4]
+
+	for _, tc := range []struct {
+		name, agentVar, defaultVar string
+		wantRouting                bool
+		wantModel                  string
+	}{
+		{name: "neither variable", wantRouting: true},
+		{name: "agent variable", agentVar: "gpt-5.6-luna", wantModel: "gpt-5.6-luna"},
+		{name: "default variable", defaultVar: "claude-sonnet-5.5", wantModel: "claude-sonnet-5.5"},
+		{name: "both variables, agent wins", agentVar: "gpt-5.6-luna", defaultVar: "claude-sonnet-5.5", wantModel: "gpt-5.6-luna"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vars := map[string]string{
+				"vars." + constants.EnvVarModelAgentCopilot: tc.agentVar,
+				"vars." + compilerenv.DefaultModelCopilot:   tc.defaultVar,
+			}
+			dir := t.TempDir()
+			outputFile := filepath.Join(dir, "output")
+			runnerTemp := filepath.Join(dir, "runner")
+			actionsDir := filepath.Join(runnerTemp, "gh-aw", "actions")
+			require.NoError(t, os.MkdirAll(actionsDir, 0o755))
+			routingScript, err := os.ReadFile("../../actions/setup/sh/resolve_model_routing.sh")
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(actionsDir, "resolve_model_routing.sh"), routingScript, 0o755))
+			cmd := exec.Command("bash", "-e", "-c", decision.Run)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "GITHUB_OUTPUT=" + outputFile, "RUNNER_TEMP=" + runnerTemp}
+			for key, value := range decision.Env {
+				cmd.Env = append(cmd.Env, key+"="+evaluateTestTemplate(t, value, vars))
+			}
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, string(out))
+			wantDiagnostic := "Model routing enabled: goal cost, mode auto"
+			if tc.agentVar != "" {
+				wantDiagnostic = "Model routing disabled: vars." + constants.EnvVarModelAgentCopilot + " selects the model"
+			} else if tc.defaultVar != "" {
+				wantDiagnostic = "Model routing disabled: vars." + compilerenv.DefaultModelCopilot + " selects the model"
+			}
+			require.Contains(t, string(out), wantDiagnostic)
+			outputs, err := os.ReadFile(outputFile)
+			require.NoError(t, err)
+			decisionValue := strings.TrimPrefix(strings.TrimSpace(string(outputs)), modelRoutingDecisionOutput+"=")
+			require.Equal(t, map[bool]string{true: "true", false: "false"}[tc.wantRouting], decisionValue)
+
+			activationContexts := map[string]string{"steps." + modelRoutingDecisionStepID + ".outputs." + modelRoutingDecisionOutput: decisionValue}
+			var modelConfig map[string]any
+			require.NoError(t, json.Unmarshal([]byte(evaluateTestTemplate(t, info.Env["GH_AW_INFO_MODEL_CONFIG"], activationContexts)), &modelConfig))
+			require.Equal(t, tc.wantRouting, modelConfig["routing"].(map[string]any)["enabled"])
+
+			downstream := map[string]string{"needs.activation.outputs." + modelRoutingDecisionOutput: decisionValue}
+			maps.Copy(downstream, vars)
+			require.Equal(t, tc.wantRouting, evaluateTestCondition(t, conversation.If, downstream), "conversation step runs only when routed")
+			require.Equal(t, tc.wantModel, evaluateTestTemplate(t, execution.Env["COPILOT_MODEL"], downstream))
+			routingFlag := evaluateTestTemplate(t, execution.Env["GH_AW_MODEL_ROUTING"], downstream)
+			require.Equal(t, tc.wantRouting, routingFlag == "1")
+
+			cmd = exec.Command("bash", "-e", "-c", configScript)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "RUNNER_TEMP=" + runnerTemp, "GH_AW_MODEL_ROUTING=" + routingFlag, "GH_AW_MAX_AI_CREDITS=0"}
+			out, err = cmd.CombinedOutput()
+			require.NoError(t, err, string(out))
+			configJSON, err := os.ReadFile(filepath.Join(runnerTemp, "gh-aw", "awf-config.json"))
+			require.NoError(t, err)
+			var awfConfig map[string]any
+			require.NoError(t, json.Unmarshal(configJSON, &awfConfig))
+			_, routed := awfConfig["apiProxy"].(map[string]any)["routing"]
+			require.Equal(t, tc.wantRouting, routed, "AWF config routing must follow the activation decision")
+			_, experimental := awfConfig["experimental"]
+			require.Equal(t, tc.wantRouting, experimental)
+		})
+	}
+}

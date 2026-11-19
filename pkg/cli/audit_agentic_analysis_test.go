@@ -1,0 +1,793 @@
+//go:build !integration
+
+package cli
+
+import (
+	"context"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/github/gh-aw/pkg/workflow"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestDetectTaskDomain(t *testing.T) {
+	t.Parallel()
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{
+			WorkflowName: "Weekly Research Report",
+			WorkflowPath: ".github/workflows/weekly-research.yml",
+			Event:        "schedule",
+		},
+	}
+
+	domain := detectTaskDomain(processedRun, nil, nil, nil)
+	require.NotNil(t, domain, "domain should be detected")
+	assert.Equal(t, "research", domain.Name)
+	assert.Equal(t, "Research", domain.Label)
+}
+
+func TestBuildAgenticAssessmentsFlagsPotentialDeterministicAlternative(t *testing.T) {
+	t.Parallel()
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{
+			WorkflowName: "Issue Triage",
+			Turns:        2,
+			Duration:     2 * time.Minute,
+		},
+	}
+	metrics := MetricsData{Turns: 2}
+	toolUsage := []ToolUsageInfo{{Name: "github_issue_read", CallCount: 1}}
+	domain := &TaskDomainInfo{Name: "triage", Label: "Triage"}
+	fingerprint := &BehaviorFingerprint{
+		ExecutionStyle:  "directed",
+		ToolBreadth:     "narrow",
+		ActuationStyle:  "read_only",
+		ResourceProfile: "lean",
+		DispatchMode:    "standalone",
+	}
+
+	assessments := buildAgenticAssessments(processedRun, metrics, toolUsage, nil, domain, fingerprint, nil)
+	require.NotEmpty(t, assessments)
+	assert.Equal(t, "overkill_for_agentic", assessments[0].Kind)
+}
+
+func TestBuildAgenticAssessmentsSuppressesDeterministicAlternativeWhenAgentWasSkipped(t *testing.T) {
+	t.Parallel()
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{
+			WorkflowName: "Issue Triage",
+			Status:       "completed",
+			Conclusion:   "failure",
+		},
+		JobDetails: []JobInfoWithDuration{
+			{JobInfo: JobInfo{Name: "pre_activation", Status: "completed", Conclusion: "failure"}},
+			{JobInfo: JobInfo{Name: "agent", Status: "completed", Conclusion: "skipped"}},
+		},
+	}
+	domain := &TaskDomainInfo{Name: "triage", Label: "Triage"}
+	fingerprint := &BehaviorFingerprint{
+		ExecutionStyle:  "directed",
+		ToolBreadth:     "narrow",
+		ActuationStyle:  "read_only",
+		ResourceProfile: "lean",
+		DispatchMode:    "standalone",
+	}
+
+	assessments := buildAgenticAssessments(processedRun, MetricsData{}, nil, nil, domain, fingerprint, nil)
+
+	for _, assessment := range assessments {
+		assert.NotEqual(t, "overkill_for_agentic", assessment.Kind)
+	}
+}
+
+func TestBuildAgenticAssessmentsFlagsResourceHeavyRun(t *testing.T) {
+	t.Parallel()
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{
+			WorkflowName:   "Deep Research",
+			Turns:          15,
+			Duration:       22 * time.Minute,
+			SafeItemsCount: 4,
+		},
+	}
+	metrics := MetricsData{Turns: 15}
+	toolUsage := []ToolUsageInfo{
+		{Name: "bash", CallCount: 4},
+		{Name: "grep", CallCount: 3},
+		{Name: "gh", CallCount: 2},
+		{Name: "github_issue_read", CallCount: 2},
+		{Name: "sed", CallCount: 1},
+		{Name: "cat", CallCount: 1},
+		{Name: "jq", CallCount: 1},
+	}
+	domain := &TaskDomainInfo{Name: "research", Label: "Research"}
+	fingerprint := buildBehaviorFingerprint(processedRun, metrics, toolUsage, []CreatedItemReport{{Type: "create_issue"}}, nil)
+
+	assessments := buildAgenticAssessments(processedRun, metrics, toolUsage, []CreatedItemReport{{Type: "create_issue"}}, domain, fingerprint, nil)
+
+	var found bool
+	for _, assessment := range assessments {
+		if assessment.Kind == "resource_heavy_for_domain" {
+			found = true
+			assert.Equal(t, "high", assessment.Severity)
+		}
+	}
+	assert.True(t, found, "resource heavy assessment should be present")
+}
+
+func TestBuildAgenticAssessmentsIncludesSessionToolFailuresInControlAssessment(t *testing.T) {
+	t.Parallel()
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{DatabaseID: 1, SafeItemsCount: 6},
+		Friction: &FrictionCostSummary{
+			TotalOccurrences:   1,
+			CountedOccurrences: 1,
+			Drivers: []FrictionDriverSummary{{
+				Driver:                "session_tool_failure",
+				Occurrences:           1,
+				CountedOccurrences:    1,
+				SuppressedOccurrences: 0,
+			}},
+		},
+	}
+	domain := &TaskDomainInfo{Name: "code_fix", Label: "Code Fix"}
+	fingerprint := &BehaviorFingerprint{
+		ExecutionStyle: "directed",
+		ActuationStyle: "write_heavy",
+	}
+
+	assessments := buildAgenticAssessments(processedRun, MetricsData{}, nil, nil, domain, fingerprint, nil)
+
+	require.Len(t, assessments, 1)
+	assert.Equal(t, "poor_agentic_control", assessments[0].Kind)
+	assert.Equal(t, "high", assessments[0].Severity)
+	assert.Contains(t, assessments[0].Evidence, "control_events=max(reported_control_signals=0, friction_counted_occurrences=1)=1")
+}
+
+func TestBuildAgenticAssessmentsLabelsReportedSignalsWhenFrictionIsUnavailable(t *testing.T) {
+	t.Parallel()
+	processedRun := ProcessedRun{
+		Run:          WorkflowRun{DatabaseID: 1, SafeItemsCount: 6},
+		MissingTools: []MissingToolReport{{Tool: "example_tool"}},
+	}
+	domain := &TaskDomainInfo{Name: "code_fix", Label: "Code Fix"}
+	fingerprint := &BehaviorFingerprint{
+		ExecutionStyle: "directed",
+		ActuationStyle: "selective_write",
+	}
+
+	assessments := buildAgenticAssessments(processedRun, MetricsData{}, nil, nil, domain, fingerprint, nil)
+
+	require.Len(t, assessments, 1)
+	assert.Equal(t, "poor_agentic_control", assessments[0].Kind)
+	assert.Contains(t, assessments[0].Evidence, "control_events=1 reported_control_signals=1 friction_counted_occurrences=unavailable")
+}
+
+func TestBuildAgenticAssessmentsControlEventCounts(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name     string
+		reported int
+		friction *FrictionCostSummary
+		want     string
+		severity string
+	}{
+		{"reported greater", 4, &FrictionCostSummary{CountedOccurrences: 1}, "control_events=max(reported_control_signals=4, friction_counted_occurrences=1)=4", "high"},
+		{"equal", 2, &FrictionCostSummary{CountedOccurrences: 2}, "control_events=max(reported_control_signals=2, friction_counted_occurrences=2)=2", "medium"},
+		{"distinct signals", 1, &FrictionCostSummary{CountedOccurrences: 2}, "control_events=max(reported_control_signals=1, friction_counted_occurrences=2)=2", "medium"},
+		{"suppressed", 0, &FrictionCostSummary{TotalOccurrences: 2, SuppressedOccurrences: 2}, "control_events=max(reported_control_signals=0, friction_counted_occurrences=0)=0", "medium"},
+		{"integrity filter", 0, &FrictionCostSummary{CountedOccurrences: 1, Drivers: []FrictionDriverSummary{{Driver: "integrity_filter", CountedOccurrences: 1}}}, "control_events=max(reported_control_signals=0, friction_counted_occurrences=1)=1", "high"},
+		{"unavailable", 0, nil, "control_events=0 reported_control_signals=0 friction_counted_occurrences=unavailable", "medium"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			processedRun := ProcessedRun{MissingTools: make([]MissingToolReport, tt.reported), Friction: tt.friction}
+			domain := &TaskDomainInfo{Name: "triage"}
+			fingerprint := &BehaviorFingerprint{ExecutionStyle: "exploratory", ActuationStyle: "read_only"}
+			if tt.name == "integrity filter" {
+				processedRun.Run.SafeItemsCount = 3
+				fingerprint.ActuationStyle = "write_heavy"
+			}
+			assessments := buildAgenticAssessments(processedRun, MetricsData{}, nil, nil, domain, fingerprint, nil)
+			require.NotEmpty(t, assessments)
+			assert.Equal(t, "poor_agentic_control", assessments[0].Kind)
+			assert.Equal(t, tt.severity, assessments[0].Severity)
+			assert.Contains(t, assessments[0].Evidence, tt.want)
+		})
+	}
+}
+
+func TestBuildAgenticAssessmentsCleanHistoricalSources(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name    string
+		summary *usageActivitySummary
+		usage   *MCPToolUsageData
+		want    string
+	}{
+		{"missing", nil, nil, "friction_counted_occurrences=unavailable"},
+		{"empty gateway", nil, &MCPToolUsageData{}, "friction_counted_occurrences=unavailable"},
+		{"clean session", &usageActivitySummary{Session: &usageActivitySession{TotalEvents: 1}}, nil, "friction_counted_occurrences=0)=0 friction_scope=derived_from_logs"},
+		{"clean gateway", nil, &MCPToolUsageData{ToolCalls: []MCPToolCall{{Status: "success"}}}, "friction_counted_occurrences=0)=0 friction_scope=derived_from_logs"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			result := &DownloadResult{RunAnalysis: RunAnalysis{MCPToolUsage: tt.usage}}
+			applyUsageActivitySummaryToResult(tt.summary, result, true)
+			run := ProcessedRun{Friction: result.Friction}
+			assessments := buildAgenticAssessments(run, MetricsData{}, nil, nil, &TaskDomainInfo{Name: "triage"}, &BehaviorFingerprint{ExecutionStyle: "exploratory"}, nil)
+			require.NotEmpty(t, assessments)
+			assert.Equal(t, "poor_agentic_control", assessments[0].Kind)
+			assert.Contains(t, assessments[0].Evidence, tt.want)
+		})
+	}
+}
+
+func TestBuildAuditDataIncludesAgenticAnalysis(t *testing.T) {
+	t.Parallel()
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{
+			DatabaseID:   7,
+			WorkflowName: "Issue Triage",
+			WorkflowPath: ".github/workflows/issue-triage.yml",
+			Status:       "completed",
+			Conclusion:   "success",
+			Duration:     3 * time.Minute,
+			Turns:        3,
+			Event:        "issues",
+			LogsPath:     t.TempDir(),
+		},
+	}
+	metrics := LogMetrics{Turns: 3}
+
+	auditData := buildAuditData(context.Background(), processedRun, metrics, nil)
+	require.NotNil(t, auditData.TaskDomain, "task domain should be present")
+	require.NotNil(t, auditData.BehaviorFingerprint, "behavioral fingerprint should be present")
+	assert.NotEmpty(t, auditData.AgenticAssessments, "agentic assessments should be present")
+	assert.Equal(t, "triage", auditData.TaskDomain.Name)
+}
+
+func TestGenerateAgenticAssessmentFindingsHaveCodes(t *testing.T) {
+	t.Parallel()
+
+	assessments := []AgenticAssessment{
+		{Kind: "resource_heavy_for_domain"},
+		{Kind: "overkill_for_agentic"},
+		{Kind: "poor_agentic_control"},
+		{Kind: "partially_reducible"},
+		{Kind: "model_downgrade_available"},
+		{Kind: "delegated_context_present"},
+	}
+
+	findings := generateAgenticAssessmentFindings(assessments)
+	require.Len(t, findings, len(assessments))
+	for _, finding := range findings {
+		assert.NotEmpty(t, finding.Code, "finding %q must have a stable code", finding.Title)
+	}
+}
+
+func TestComputeAgenticFraction(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		run      WorkflowRun
+		minAlpha float64
+		maxAlpha float64
+	}{
+		{
+			name:     "zero turns returns zero",
+			run:      WorkflowRun{Turns: 0},
+			minAlpha: 0.0,
+			maxAlpha: 0.0,
+		},
+		{
+			name:     "short read-only run is fully agentic",
+			run:      WorkflowRun{Turns: 2},
+			minAlpha: 1.0,
+			maxAlpha: 1.0,
+		},
+		{
+			name:     "write-heavy run with many turns has partial fraction",
+			run:      WorkflowRun{Turns: 10, SafeItemsCount: 3},
+			minAlpha: 0.3,
+			maxAlpha: 0.5,
+		},
+		{
+			name:     "long read-only run returns 0.5",
+			run:      WorkflowRun{Turns: 8},
+			minAlpha: 0.5,
+			maxAlpha: 0.5,
+		},
+		{
+			name:     "single write action in multi-turn run",
+			run:      WorkflowRun{Turns: 6, SafeItemsCount: 1},
+			minAlpha: 0.3,
+			maxAlpha: 0.4,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			pr := ProcessedRun{Run: tt.run}
+			alpha := computeAgenticFraction(pr)
+			assert.GreaterOrEqual(t, alpha, tt.minAlpha, "agentic fraction should be >= %v", tt.minAlpha)
+			assert.LessOrEqual(t, alpha, tt.maxAlpha, "agentic fraction should be <= %v", tt.maxAlpha)
+		})
+	}
+}
+
+func TestBuildBehaviorFingerprintIncludesAgenticFraction(t *testing.T) {
+	t.Parallel()
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{
+			Turns:          8,
+			Duration:       10 * time.Minute,
+			SafeItemsCount: 2,
+		},
+	}
+	metrics := MetricsData{Turns: 8}
+	toolUsage := []ToolUsageInfo{
+		{Name: "bash", CallCount: 3},
+		{Name: "github_issue_read", CallCount: 2},
+	}
+
+	fp := buildBehaviorFingerprint(processedRun, metrics, toolUsage, nil, nil)
+	require.NotNil(t, fp, "fingerprint should not be nil")
+	assert.Greater(t, fp.AgenticFraction, 0.0, "agentic fraction should be positive")
+	assert.LessOrEqual(t, fp.AgenticFraction, 1.0, "agentic fraction should be <= 1.0")
+}
+
+func TestBuildAgenticAssessmentsFlagsPartiallyReducible(t *testing.T) {
+	t.Parallel()
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{
+			WorkflowName:   "Data Collector",
+			Turns:          10,
+			Duration:       8 * time.Minute,
+			SafeItemsCount: 2,
+		},
+	}
+	metrics := MetricsData{Turns: 10}
+	toolUsage := []ToolUsageInfo{
+		{Name: "bash", CallCount: 5},
+		{Name: "github_issue_read", CallCount: 3},
+		{Name: "gh", CallCount: 2},
+		{Name: "jq", CallCount: 1},
+	}
+	domain := &TaskDomainInfo{Name: "research", Label: "Research"}
+	fingerprint := buildBehaviorFingerprint(processedRun, metrics, toolUsage, nil, nil)
+
+	assessments := buildAgenticAssessments(processedRun, metrics, toolUsage, nil, domain, fingerprint, nil)
+
+	var found bool
+	for _, a := range assessments {
+		if a.Kind == "partially_reducible" {
+			found = true
+			assert.Contains(t, a.Summary, "data-gathering", "summary should mention data-gathering")
+			assert.Contains(t, a.Recommendation, "steps:", "recommendation should mention steps:")
+		}
+	}
+	assert.True(t, found, "partially_reducible assessment should be present for low agentic fraction moderate run")
+}
+
+func modelDowngradeTriageInputs() (ProcessedRun, MetricsData, []ToolUsageInfo, *TaskDomainInfo) {
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{
+			WorkflowName:   "Issue Triage Moderate",
+			Turns:          7,
+			Duration:       6 * time.Minute,
+			SafeItemsCount: 1,
+		},
+	}
+	metrics := MetricsData{Turns: 7}
+	toolUsage := []ToolUsageInfo{
+		{Name: "bash", CallCount: 3},
+		{Name: "github_issue_read", CallCount: 2},
+		{Name: "grep", CallCount: 1},
+		{Name: "jq", CallCount: 1},
+	}
+	return processedRun, metrics, toolUsage, &TaskDomainInfo{Name: "triage", Label: "Triage"}
+}
+
+func modelDowngradeAssessments(t *testing.T, routing *ModelRoutingSummary) []AgenticAssessment {
+	t.Helper()
+	processedRun, metrics, toolUsage, domain := modelDowngradeTriageInputs()
+	processedRun.ModelRouting = routing
+	fingerprint := buildBehaviorFingerprint(processedRun, metrics, toolUsage, nil, nil)
+	require.NotEqual(t, "lean", fingerprint.ResourceProfile, "fixture must use a non-lean resource profile")
+	require.NotEqual(t, "write_heavy", fingerprint.ActuationStyle, "fixture must not be write_heavy")
+	var downgrades []AgenticAssessment
+	for _, a := range buildAgenticAssessments(processedRun, metrics, toolUsage, nil, domain, fingerprint, nil) {
+		if a.Kind == "model_downgrade_available" {
+			downgrades = append(downgrades, a)
+		}
+	}
+	return downgrades
+}
+
+const routedGPTResponsesRoutingFixture = "testdata/model_routing_golden/copilot-routed-gpt-responses/sandbox/firewall/logs/api-proxy-logs/model-routing.jsonl"
+
+// parseDerivedModelRoutingFixture parses a temporary copy of the checked-in
+// routed fixture after applying string replacements to its existing fields.
+func parseDerivedModelRoutingFixture(t *testing.T, replacements ...string) *ModelRoutingSummary {
+	t.Helper()
+	data, err := os.ReadFile(routedGPTResponsesRoutingFixture)
+	require.NoError(t, err)
+	content := string(data)
+	for i := 0; i+1 < len(replacements); i += 2 {
+		require.Contains(t, content, replacements[i], "fixture must contain the replaced field")
+		content = strings.ReplaceAll(content, replacements[i], replacements[i+1])
+	}
+	path := filepath.Join(t.TempDir(), "model-routing.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+	return parseModelRoutingFile(path, nil)
+}
+
+func assertNeutralModelDowngrade(t *testing.T, assessment AgenticAssessment) {
+	t.Helper()
+	assert.Equal(t, "low", assessment.Severity)
+	assertPerTaskRoutingChange(t, assessment)
+	assert.Contains(t, assessment.Recommendation, "https://github.github.com/gh-aw/reference/model-routing/")
+	assert.Contains(t, assessment.Recommendation, "eligible for default routing", "omission alternative must be eligibility-qualified")
+	assertNoModelPinAdvice(t, assessment)
+	for _, text := range []string{assessment.Summary, assessment.Recommendation} {
+		assert.NotContains(t, text, "already routed")
+		assert.NotContains(t, text, "not routed")
+		assert.NotContains(t, text, "routing is off")
+		assert.NotContains(t, text, "routing was off")
+	}
+}
+
+func assertPerTaskRoutingChange(t *testing.T, assessment AgenticAssessment) {
+	t.Helper()
+	assert.Contains(t, assessment.Recommendation, "change engine.model (if set) or the top-level model to router;", "should replace the existing model setting, which takes precedence")
+	assert.Contains(t, assessment.Recommendation, "engine.model-routing block, set its mode: auto", "router values are rejected alongside a model-routing block")
+	assert.Contains(t, assessment.Recommendation, "cap routing at the lowest level, use router/economy", "router/economy should be offered only as an explicit cap")
+}
+
+func assertNoModelPinAdvice(t *testing.T, assessment AgenticAssessment) {
+	t.Helper()
+	for _, text := range []string{assessment.Summary, assessment.Recommendation} {
+		for _, forbidden := range []string{"gpt-", "claude-", "haiku", "gemini", "pin"} {
+			assert.NotContains(t, text, forbidden)
+		}
+	}
+}
+
+func TestBuildAgenticAssessmentsFlagsModelDowngrade(t *testing.T) {
+	t.Parallel()
+	downgrades := modelDowngradeAssessments(t, nil)
+	require.Len(t, downgrades, 1, "model_downgrade_available assessment should be present for moderate triage run")
+	assertPerTaskRoutingChange(t, downgrades[0])
+	assertNoModelPinAdvice(t, downgrades[0])
+}
+
+func TestModelDowngradeAssessmentIsRoutingAware(t *testing.T) {
+	t.Parallel()
+
+	neutral := modelDowngradeAssessments(t, nil)
+	require.Len(t, neutral, 1)
+
+	tests := []struct {
+		name    string
+		routing func(t *testing.T) *ModelRoutingSummary
+		// expect is "neutral", "routed", or "none".
+		expect string
+		level  string
+	}{
+		{name: "A unrouted known not_routed", routing: func(t *testing.T) *ModelRoutingSummary { return &ModelRoutingSummary{Status: "not_routed"} }, expect: "neutral"},
+		{name: "A unrouted classification only", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseDerivedModelRoutingFixture(t, `"stage":"selection"`, `"stage":"ignored"`)
+		}, expect: "neutral"},
+		{name: "B routed fixed balanced objective", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseDerivedModelRoutingFixture(t, `"mode":"economy"`, `"mode":"balanced"`, `"objective":{"goal":"cost","mode":"auto"}`, `"objective":{"goal":"cost","mode":"balanced"}`)
+		}, expect: "routed", level: "balanced"},
+		{name: "B routed fixed robust objective", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseDerivedModelRoutingFixture(t, `"mode":"economy"`, `"mode":"robust"`, `"objective":{"goal":"cost","mode":"auto"}`, `"objective":{"goal":"cost","mode":"robust"}`)
+		}, expect: "routed", level: "robust"},
+		{name: "B2 auto objective resolved balanced", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseDerivedModelRoutingFixture(t, `"mode":"economy"`, `"mode":"balanced"`)
+		}, expect: "none"},
+		{name: "B2 auto objective resolved robust", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseDerivedModelRoutingFixture(t, `"mode":"economy"`, `"mode":"robust"`)
+		}, expect: "none"},
+		{name: "C fixture auto objective resolved economy", routing: func(t *testing.T) *ModelRoutingSummary {
+			return analyzeModelRouting(filepath.Join("testdata", "model_routing_golden", "copilot-routed-gpt-responses"))
+		}, expect: "none"},
+		{name: "C explicit economy objective", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseDerivedModelRoutingFixture(t, `"objective":{"goal":"cost","mode":"auto"}`, `"objective":{"goal":"cost","mode":"economy"}`)
+		}, expect: "none"},
+		{name: "D selected level without objective mode", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseDerivedModelRoutingFixture(t, `"mode":"economy"`, `"mode":"balanced"`, `"objective":{"goal":"cost","mode":"auto"}`, `"objective":{"goal":"cost"}`)
+		}, expect: "neutral"},
+		{name: "D missing evidence", routing: func(t *testing.T) *ModelRoutingSummary { return analyzeModelRouting(t.TempDir()) }, expect: "neutral"},
+		{name: "D unreadable evidence", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseModelRoutingFile(filepath.Join(t.TempDir(), "missing.jsonl"), nil)
+		}, expect: "neutral"},
+		{name: "D malformed evidence", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseDerivedModelRoutingFixture(t, `"_schema":"model-routing/`, `"_schema":"unknown/`)
+		}, expect: "neutral"},
+		{name: "D selection without mode", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseDerivedModelRoutingFixture(t, `"mode":"economy",`, ``)
+		}, expect: "neutral"},
+		{name: "D unknown selection mode", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseDerivedModelRoutingFixture(t, `"mode":"economy"`, `"mode":"turbo"`)
+		}, expect: "neutral"},
+		{name: "D unresolved auto selection mode", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseDerivedModelRoutingFixture(t, `"mode":"economy"`, `"mode":"auto"`)
+		}, expect: "neutral"},
+		{name: "D selection without selected model", routing: func(t *testing.T) *ModelRoutingSummary {
+			return parseDerivedModelRoutingFixture(t, `"selected_id":"choice-0017","selected_model":"github-copilot/gpt-5.6-luna",`, ``)
+		}, expect: "neutral"},
+		{name: "D failed routing with economy mode", routing: func(t *testing.T) *ModelRoutingSummary {
+			summary := parseDerivedModelRoutingFixture(t)
+			summary.Status = "failed"
+			summary.Failure = &ModelRoutingFailure{Code: "router_unavailable"}
+			return summary
+		}, expect: "neutral"},
+		{name: "D outcome-only session", routing: func(t *testing.T) *ModelRoutingSummary {
+			runDir := t.TempDir()
+			require.NoError(t, os.MkdirAll(filepath.Join(runDir, "usage"), 0700))
+			session := `{"type":"model_routing.outcome","data":{"status":"selected","wireModel":"gpt-5.6-luna"},"provenance":{"component":"agent","phase":"agent","path":"agent/awf-routing-outcome.json","index":0}}` + "\n"
+			require.NoError(t, os.WriteFile(filepath.Join(runDir, "usage", "aw_session.jsonl"), []byte(session), 0600))
+			return analyzeModelRouting(runDir)
+		}, expect: "neutral"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			downgrades := modelDowngradeAssessments(t, tt.routing(t))
+			switch tt.expect {
+			case "none":
+				assert.Empty(t, downgrades, "economy or classifier-chosen route must not emit model_downgrade_available")
+			case "neutral":
+				require.Len(t, downgrades, 1)
+				assertNeutralModelDowngrade(t, downgrades[0])
+				assert.Equal(t, neutral[0].Summary, downgrades[0].Summary)
+				assert.Equal(t, neutral[0].Recommendation, downgrades[0].Recommendation)
+			case "routed":
+				require.Len(t, downgrades, 1)
+				assert.Equal(t, "low", downgrades[0].Severity)
+				assert.Contains(t, downgrades[0].Summary, "fixed "+tt.level+" level")
+				assert.Contains(t, downgrades[0].Evidence, "routing_objective_mode="+tt.level)
+				assert.Contains(t, downgrades[0].Recommendation, "Let the router pick the level for each task")
+				assertPerTaskRoutingChange(t, downgrades[0])
+				assertNoModelPinAdvice(t, downgrades[0])
+			}
+		})
+	}
+}
+
+func TestModelDowngradeEconomyRouteSuppressesFinding(t *testing.T) {
+	t.Parallel()
+	processedRun, metrics, toolUsage, domain := modelDowngradeTriageInputs()
+	processedRun.ModelRouting = analyzeModelRouting(filepath.Join("testdata", "model_routing_golden", "copilot-routed-gpt-responses"))
+	require.NotNil(t, processedRun.ModelRouting)
+	require.Equal(t, "selected", processedRun.ModelRouting.Status)
+	require.Equal(t, "auto", processedRun.ModelRouting.ObjectiveMode)
+	require.Equal(t, "economy", processedRun.ModelRouting.Mode)
+
+	fingerprint := buildBehaviorFingerprint(processedRun, metrics, toolUsage, nil, nil)
+	assessments := buildAgenticAssessments(processedRun, metrics, toolUsage, nil, domain, fingerprint, nil)
+	for _, assessment := range assessments {
+		assert.NotEqual(t, "model_downgrade_available", assessment.Kind)
+	}
+	for _, finding := range generateAgenticAssessmentFindings(assessments) {
+		assert.NotEqual(t, AuditFindingAgenticModelDowngrade, finding.Code)
+	}
+	for _, recommendation := range generateAgenticAssessmentRecommendations(assessments) {
+		assert.NotContains(t, recommendation.Action, "router/economy")
+	}
+}
+
+func TestActionMinutesComputedFromDuration(t *testing.T) {
+	t.Parallel()
+	run := WorkflowRun{
+		Duration: 3*time.Minute + 30*time.Second,
+	}
+	// ActionMinutes should be ceil of Duration in minutes
+	// Since ActionMinutes is set by logs_orchestrator, test the formula directly
+	expected := 4.0 // ceil(3.5)
+	actual := math.Ceil(run.Duration.Minutes())
+	assert.InDelta(t, expected, actual, 0.001, "ActionMinutes should be ceiling of duration in minutes")
+}
+
+func TestPrettifyAssessmentKindNewKinds(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "Partially Reducible To Deterministic", prettifyAssessmentKind("partially_reducible"))
+	assert.Equal(t, "Cheaper Model Available", prettifyAssessmentKind("model_downgrade_available"))
+}
+
+func TestGenerateAgenticAssessmentFindingsSetsStableCodes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		kind string
+		code AuditFindingCode
+	}{
+		{kind: "resource_heavy_for_domain", code: AuditFindingAgenticResourceHeavy},
+		{kind: "overkill_for_agentic", code: AuditFindingAgenticOverkill},
+		{kind: "poor_agentic_control", code: AuditFindingAgenticPoorControl},
+		{kind: "partially_reducible", code: AuditFindingAgenticPartiallyReducible},
+		{kind: "model_downgrade_available", code: AuditFindingAgenticModelDowngrade},
+		{kind: "delegated_context_present", code: AuditFindingAgenticDelegatedContext},
+	}
+	for _, tt := range tests {
+		t.Run(tt.kind, func(t *testing.T) {
+			t.Parallel()
+
+			findings := generateAgenticAssessmentFindings([]AgenticAssessment{{
+				Kind:     tt.kind,
+				Severity: "medium",
+				Summary:  "summary",
+			}})
+
+			require.Len(t, findings, 1)
+			assert.Equal(t, tt.code, findings[0].Code)
+		})
+	}
+}
+
+func TestBuildToolUsageInfoAggregatesAndSorts(t *testing.T) {
+	t.Parallel()
+	metrics := LogMetrics{
+		ToolCalls: []workflow.ToolCallInfo{
+			{Name: "bash", CallCount: 3, MaxInputSize: 100, MaxOutputSize: 200, MaxDuration: 1 * time.Second},
+			{Name: "github_issue_read", CallCount: 5, MaxInputSize: 50, MaxOutputSize: 300, MaxDuration: 500 * time.Millisecond},
+			{Name: "bash", CallCount: 2, MaxInputSize: 150, MaxOutputSize: 180, MaxDuration: 2 * time.Second},
+		},
+	}
+
+	result := buildToolUsageInfo(metrics)
+
+	require.Len(t, result, 2, "duplicate tool names should be merged")
+
+	// bash has CallCount 3+2=5 (merged), github_issue_read has CallCount 5.
+	// Both have equal call counts, so the tie is broken alphabetically: "bash" < "github_issue_read".
+	assert.Equal(t, "bash", result[0].Name, "alphabetically first among equal call counts should be first")
+	assert.Equal(t, 5, result[0].CallCount, "bash call counts should be summed: 3+2=5")
+	assert.Equal(t, 150, result[0].MaxInputSize, "max input size should be max across merged entries")
+	assert.Equal(t, 200, result[0].MaxOutputSize, "max output size should be max across merged entries")
+	assert.NotEmpty(t, result[0].MaxDuration, "max duration should be set from the longest call")
+
+	assert.Equal(t, "github_issue_read", result[1].Name, "alphabetically second should be second")
+	assert.Equal(t, 5, result[1].CallCount, "call count for github_issue_read should be 5")
+}
+
+func TestBuildToolUsageInfoEmpty(t *testing.T) {
+	t.Parallel()
+	result := buildToolUsageInfo(LogMetrics{})
+	assert.Empty(t, result, "empty metrics should produce empty tool usage")
+}
+
+func TestBuildToolUsageInfoSortOrderTieBreak(t *testing.T) {
+	t.Parallel()
+	metrics := LogMetrics{
+		ToolCalls: []workflow.ToolCallInfo{
+			{Name: "zebra_tool", CallCount: 2},
+			{Name: "alpha_tool", CallCount: 2},
+		},
+	}
+
+	result := buildToolUsageInfo(metrics)
+
+	require.Len(t, result, 2, "should have two distinct tools")
+	assert.Equal(t, "alpha_tool", result[0].Name, "tools with equal call counts should be sorted alphabetically")
+	assert.Equal(t, "zebra_tool", result[1].Name, "tools with equal call counts should be sorted alphabetically")
+}
+
+func TestBuildAuditDataToolUsageMatchesBuildToolUsageInfo(t *testing.T) {
+	t.Parallel()
+	metrics := LogMetrics{
+		ToolCalls: []workflow.ToolCallInfo{
+			{Name: "bash", CallCount: 4, MaxInputSize: 100, MaxOutputSize: 200},
+			{Name: "github_issue_read", CallCount: 7, MaxInputSize: 50, MaxOutputSize: 300},
+		},
+		Turns: 5,
+	}
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{
+			DatabaseID:   1,
+			WorkflowName: "Test Workflow",
+			Status:       "completed",
+			Conclusion:   "success",
+			LogsPath:     t.TempDir(),
+		},
+	}
+
+	auditData := buildAuditData(context.Background(), processedRun, metrics, nil)
+	expected := buildToolUsageInfo(metrics)
+
+	require.Equal(t, expected, auditData.ToolUsage, "buildAuditData tool usage should match buildToolUsageInfo output")
+}
+
+func TestMergeMCPToolUsageInfoUsesSummaryWhenMetricsToolCallsEmpty(t *testing.T) {
+	t.Parallel()
+	merged := mergeMCPToolUsageInfo(nil, &MCPToolUsageData{
+		Summary: []MCPToolSummary{
+			{ServerName: "safeoutputs", ToolUsageStatsBase: ToolUsageStatsBase{ToolName: "create_discussion", CallCount: 2, MaxOutputSize: 1200}, MaxInputSize: 50},
+			{ServerName: "safeoutputs", ToolUsageStatsBase: ToolUsageStatsBase{ToolName: "push_repo_memory", CallCount: 1, MaxOutputSize: 240}, MaxInputSize: 32},
+		},
+	})
+
+	require.Len(t, merged, 2, "MCP summary should be represented as tool usage entries")
+	assert.Equal(t, "safeoutputs.create_discussion", merged[0].Name, "higher call-count MCP tool should sort first")
+	assert.Equal(t, 2, merged[0].CallCount, "call count should come from MCP summary")
+	assert.Equal(t, "safeoutputs.push_repo_memory", merged[1].Name, "second MCP tool should be preserved")
+}
+
+func TestMergeMCPToolUsageInfoFallsBackToToolCalls(t *testing.T) {
+	t.Parallel()
+	merged := mergeMCPToolUsageInfo(nil, &MCPToolUsageData{
+		ToolCalls: []MCPToolCall{
+			{ServerName: "safeoutputs", ToolName: "create_discussion", InputSize: 20, OutputSize: 200},
+			{ServerName: "safeoutputs", ToolName: "create_discussion", InputSize: 40, OutputSize: 250},
+			{ServerName: "safeoutputs", ToolName: "push_repo_memory", InputSize: 10, OutputSize: 100},
+		},
+	})
+
+	require.Len(t, merged, 2, "fallback should aggregate MCP tool calls when summary is absent")
+	assert.Equal(t, "safeoutputs.create_discussion", merged[0].Name, "tool call fallback should aggregate by MCP tool name")
+	assert.Equal(t, 2, merged[0].CallCount, "fallback should count repeated MCP tool calls")
+	assert.Equal(t, 40, merged[0].MaxInputSize, "fallback should keep max input size from calls")
+	assert.Equal(t, 250, merged[0].MaxOutputSize, "fallback should keep max output size from calls")
+}
+
+// TestDeriveRunAgenticAnalysisFingerprintConsistency verifies that the fingerprint
+// produced by deriveRunAgenticAnalysis is consistent when Run.Turns is correctly
+// populated from log metrics. This guards against the bug where logs_orchestrator.go
+// computed the fingerprint before updating result.Run.Turns from extracted metrics,
+// causing different fingerprint values between the logs and audit tools for the same run.
+func TestDeriveRunAgenticAnalysisFingerprintConsistency(t *testing.T) {
+	t.Parallel()
+	const metricsTurns = 12
+
+	logMetrics := LogMetrics{
+		Turns: metricsTurns,
+		ToolCalls: []workflow.ToolCallInfo{
+			{Name: "bash", CallCount: 5},
+			{Name: "github_issue_read", CallCount: 3},
+		},
+	}
+
+	// Simulate the corrected behavior (post-fix): Run.Turns is set from log metrics
+	// before deriveRunAgenticAnalysis is called, matching what audit.go does.
+	processedRunFixed := ProcessedRun{
+		Run: WorkflowRun{
+			Turns:    metricsTurns, // set from metrics.Turns
+			Duration: 20 * time.Minute,
+		},
+	}
+	_, _, _, _, fpFixed, _ := deriveRunAgenticAnalysis(processedRunFixed, logMetrics)
+
+	require.NotNil(t, fpFixed, "fingerprint should not be nil")
+	assert.Equal(t, "exploratory", fpFixed.ExecutionStyle, "12 turns should produce exploratory execution style")
+	assert.Equal(t, "heavy", fpFixed.ResourceProfile, "20 min duration should produce heavy resource profile")
+	assert.Greater(t, fpFixed.AgenticFraction, 0.0, "agentic fraction should be positive when turns > 0")
+
+	// Simulate the broken behavior (pre-fix): Run.Turns is zero because the orchestrator
+	// had not yet updated it from extracted metrics when computing the fingerprint.
+	processedRunStale := ProcessedRun{
+		Run: WorkflowRun{
+			Turns:    0, // stale — NOT updated from metrics.Turns
+			Duration: 20 * time.Minute,
+		},
+	}
+	_, _, _, _, fpStale, _ := deriveRunAgenticAnalysis(processedRunStale, logMetrics)
+
+	require.NotNil(t, fpStale, "fingerprint should not be nil even with zero turns")
+	assert.Equal(t, "directed", fpStale.ExecutionStyle, "zero turns should produce directed execution style")
+	assert.InDelta(t, 0.0, fpStale.AgenticFraction, 0.001, "agentic fraction should be zero when Run.Turns is zero")
+
+	// Confirm the two results differ — this is exactly the inconsistency the fix resolves.
+	assert.NotEqual(t, fpFixed.ExecutionStyle, fpStale.ExecutionStyle,
+		"fingerprints should differ when Run.Turns is stale vs. correctly set from metrics")
+	assert.NotEqual(t, fpFixed.AgenticFraction, fpStale.AgenticFraction,
+		"agentic fraction should differ when Run.Turns is stale vs. correctly set from metrics")
+}
